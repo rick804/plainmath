@@ -1,0 +1,347 @@
+"""
+The parsing + layout engine for plainmath's math blocks.
+
+Grammar (recursive, so fractions can nest):
+    Sequence := Term ( ('+'|'-') Term )*
+    Term     := Frac | Group | Atom
+    Group    := '(' Sequence ')'                      (always balanced —
+                only ever created by the app itself, see plainmath.py)
+    Frac     := (Group | Atom) '/' (Group | Sequence-to-end-of-input)
+    Atom     := run of [A-Za-z0-9_.]
+
+Denominators default to "everything to the end of input" (greedy) unless
+explicitly closed with parens — which the app inserts automatically when
+you press Right at the true end of an open denominator. That single rule
+is what makes "a/b" + Right + "+3" turn into "a/(b)+3", rendered as the
+fraction a-over-b with "+ 3" trailing at the baseline.
+"""
+
+import re
+from dataclasses import dataclass, field
+from typing import List, Tuple, Union
+
+ATOM_CHARS_RE = re.compile(r"[A-Za-z0-9_.]")
+STOP_TOKEN_RE = re.compile(r"[A-Za-z0-9_.]+|[+\-/=*]")
+
+
+@dataclass
+class AtomNode:
+    text: str
+    start: int
+    end: int
+
+
+@dataclass
+class TextNode:
+    """A run of ordinary prose — spaces, words, punctuation — that sits
+    at the baseline like a plain atom, but is never itself a candidate
+    numerator/denominator (only a real Atom or Group can be that)."""
+    text: str
+    start: int
+    end: int
+
+
+@dataclass
+class GroupNode:
+    inner: "Sequence"
+    start: int  # position of '('
+    end: int    # position right after the matching ')'
+
+
+@dataclass
+class FracNode:
+    numerator: "Term"
+    denominator: "Sequence"
+    slash_pos: int
+    den_start: int
+    den_end: int
+    den_explicit: bool
+    start: int
+    end: int
+
+
+Term = Union[AtomNode, TextNode, GroupNode, FracNode]
+Sequence = List[Tuple[str, Term]]
+
+
+# ---------------------------------------------------------------- parsing
+
+def parse_line(line: str) -> Sequence:
+    if not line:
+        return []
+    seq, _ = _parse_sequence(line, 0, len(line))
+    return seq
+
+
+OPERATOR_CHARS = "+-=*"
+
+
+def _is_prose_char(ch: str) -> bool:
+    """True for characters that are just ordinary prose — spaces, words'
+    punctuation, etc — as opposed to math syntax we actively parse."""
+    return not (ch.isalnum() or ch in "_.(/)" + OPERATOR_CHARS)
+
+
+def _parse_sequence(s: str, pos: int, end: int) -> Tuple[Sequence, int]:
+    terms: Sequence = []
+    first = True
+    while pos < end:
+        op = ""
+        if not first and s[pos] in OPERATOR_CHARS:
+            op = s[pos]
+            pos += 1
+        if pos >= end:
+            break
+        if _is_prose_char(s[pos]):
+            j = pos
+            while j < end and _is_prose_char(s[j]):
+                j += 1
+            node: Term = TextNode(text=s[pos:j], start=pos, end=j)
+            pos = j
+        else:
+            node, pos = _parse_term(s, pos, end)
+        terms.append((op, node))
+        first = False
+    return terms, pos
+
+
+def _parse_term(s: str, pos: int, end: int) -> Tuple[Term, int]:
+    start = pos
+    if pos < end and s[pos] == "(":
+        inner_seq, close_pos = _parse_group(s, pos, end)
+        node: Term = GroupNode(inner=inner_seq, start=start, end=close_pos)
+        pos = close_pos
+    else:
+        j = pos
+        while j < end and ATOM_CHARS_RE.match(s[j]):
+            j += 1
+        node = AtomNode(text=s[pos:j], start=pos, end=j)
+        pos = j
+
+    if pos < end and s[pos] == "/":
+        slash_pos = pos
+        pos += 1
+        if pos < end and s[pos] == "(":
+            den_seq, close_pos = _parse_group(s, pos, end)
+            frac = FracNode(
+                numerator=node, denominator=den_seq, slash_pos=slash_pos,
+                den_start=pos + 1, den_end=close_pos - 1, den_explicit=True,
+                start=start, end=close_pos,
+            )
+            pos = close_pos
+        else:
+            den_seq, new_pos = _parse_sequence(s, pos, end)
+            frac = FracNode(
+                numerator=node, denominator=den_seq, slash_pos=slash_pos,
+                den_start=pos, den_end=new_pos, den_explicit=False,
+                start=start, end=new_pos,
+            )
+            pos = new_pos
+        return frac, pos
+
+    return node, pos
+
+
+def _parse_group(s: str, pos: int, end: int) -> Tuple[Sequence, int]:
+    depth = 1
+    j = pos + 1
+    while j < end and depth > 0:
+        if s[j] == "(":
+            depth += 1
+        elif s[j] == ")":
+            depth -= 1
+        j += 1
+    close_pos = j
+    inner_seq, _ = _parse_sequence(s, pos + 1, close_pos - 1)
+    return inner_seq, close_pos
+
+
+def _term_span(term: Term) -> Tuple[int, int]:
+    return term.start, term.end
+
+
+# ---------------------------------------------------------------- layout
+
+def format_op(op: str) -> str:
+    return f" {op} "
+
+
+def layout_term(term: Term) -> Tuple[List[str], int, int]:
+    """Returns (lines, baseline_row, width)."""
+    if isinstance(term, (AtomNode, TextNode)):
+        text = term.text
+        return [text], 0, len(text)
+
+    if isinstance(term, GroupNode):
+        return layout_sequence(term.inner)
+
+    if isinstance(term, FracNode):
+        num_lines, _num_baseline, num_width = layout_term(term.numerator)
+        den_lines, _den_baseline, den_width = layout_sequence(term.denominator)
+        content_width = max(num_width, den_width, 1)
+        bar_width = content_width + 2
+
+        num_pad_l = (bar_width - num_width) // 2
+        num_pad_r = bar_width - num_width - num_pad_l
+        den_pad_l = (bar_width - den_width) // 2
+        den_pad_r = bar_width - den_width - den_pad_l
+
+        padded_num = [(" " * num_pad_l) + l + (" " * num_pad_r) for l in num_lines]
+        padded_den = [(" " * den_pad_l) + l + (" " * den_pad_r) for l in den_lines]
+
+        lines = padded_num + ["-" * bar_width] + padded_den
+        baseline = len(padded_num)
+        return lines, baseline, bar_width
+
+    raise TypeError(f"unknown term type: {term!r}")
+
+
+def layout_sequence(seq: Sequence) -> Tuple[List[str], int, int]:
+    if not seq:
+        return [""], 0, 0
+
+    blocks = []
+    for op, term in seq:
+        lines, baseline, width = layout_term(term)
+        blocks.append((op, lines, baseline, width))
+
+    top = max(b for (_, _, b, _) in blocks)
+    bottom = max(len(l) - b - 1 for (_, l, b, _) in blocks)
+    height = top + 1 + bottom
+
+    out_lines = [""] * height
+    for idx, (op, lines, baseline, width) in enumerate(blocks):
+        pad_above = top - baseline
+        pad_below = height - pad_above - len(lines)
+        full = ([" " * width] * pad_above) + lines + ([" " * width] * pad_below)
+        op_str = format_op(op) if (idx != 0 and op) else ""
+        for r in range(height):
+            filler = op_str if r == top else " " * len(op_str)
+            out_lines[r] += filler + full[r]
+
+    total_width = len(out_lines[0]) if out_lines else 0
+    return out_lines, top, total_width
+
+
+def render_line(line: str) -> List[str]:
+    if not line.strip():
+        return []
+    seq = parse_line(line)
+    lines, _baseline, _width = layout_sequence(seq)
+    return lines
+
+
+# ---------------------------------------------------------- cursor mapping
+
+def locate_cursor(line: str, raw_col: int) -> Tuple[int, int]:
+    seq = parse_line(line)
+    if not seq:
+        return 0, 0
+    return _locate_in_sequence(seq, raw_col)
+
+
+def _locate_in_sequence(seq: Sequence, raw_offset: int) -> Tuple[int, int]:
+    if not seq:
+        return 0, 0
+
+    blocks = []
+    for op, term in seq:
+        lines, baseline, width = layout_term(term)
+        blocks.append((op, term, lines, baseline, width))
+
+    top = max(b for (_, _, _, b, _) in blocks)
+    col_acc = 0
+    for idx, (op, term, lines, baseline, width) in enumerate(blocks):
+        op_str = format_op(op) if (idx != 0 and op) else ""
+        _t_start, t_end = _term_span(term)
+        if raw_offset <= t_end:
+            pad_above = top - baseline
+            r, c = _locate_in_term(term, raw_offset)
+            return r + pad_above, col_acc + len(op_str) + c
+        col_acc += len(op_str) + width
+
+    # Past every term: rest at the end, on the baseline row.
+    return top, col_acc
+
+
+def _locate_in_term(term: Term, raw_offset: int) -> Tuple[int, int]:
+    if isinstance(term, (AtomNode, TextNode)):
+        c = max(0, min(raw_offset - term.start, len(term.text)))
+        return 0, c
+
+    if isinstance(term, GroupNode):
+        inner_start, inner_end = term.start + 1, term.end - 1
+        clamped = max(inner_start, min(raw_offset, inner_end))
+        return _locate_in_sequence(term.inner, clamped)
+
+    if isinstance(term, FracNode):
+        num_lines, _nb, num_width = layout_term(term.numerator)
+        den_lines, _db, den_width = layout_sequence(term.denominator)
+        content_width = max(num_width, den_width, 1)
+        bar_width = content_width + 2
+        num_pad_l = (bar_width - num_width) // 2
+        den_pad_l = (bar_width - den_width) // 2
+
+        if raw_offset <= term.slash_pos:
+            _num_start, num_end = _term_span(term.numerator)
+            r, c = _locate_in_term(term.numerator, min(raw_offset, num_end))
+            return r, num_pad_l + c
+
+        clamped = max(term.den_start, min(raw_offset, term.den_end))
+        r, c = _locate_in_sequence(term.denominator, clamped)
+        row_base = len(num_lines) + 1
+        return row_base + r, den_pad_l + c
+
+    raise TypeError(f"unknown term type: {term!r}")
+
+
+# --------------------------------------------------------- element stops
+
+def cursor_stops(line: str) -> List[int]:
+    stops = {0, len(line)}
+    for m in STOP_TOKEN_RE.finditer(line):
+        stops.add(m.start())
+        stops.add(m.end())
+    return sorted(stops)
+
+
+def next_stop(line: str, col: int) -> int:
+    for s in cursor_stops(line):
+        if s > col:
+            return s
+    return len(line)
+
+
+def prev_stop(line: str, col: int) -> int:
+    prev = 0
+    for s in cursor_stops(line):
+        if s >= col:
+            break
+        prev = s
+    return prev
+
+
+# ------------------------------------------------------- exit-and-wrap
+
+def _find_innermost_open_frac(seq: Sequence):
+    if not seq:
+        return None
+    _op, term = seq[-1]
+    if isinstance(term, FracNode) and not term.den_explicit:
+        inner = _find_innermost_open_frac(term.denominator)
+        return inner if inner is not None else term
+    return None
+
+
+def try_close_fraction(line: str, col: int):
+    """If the cursor is at the true end of the line and there's an open
+    (un-parenthesized) fraction denominator there, wrap it in parens.
+    Returns (new_line, new_col) or None if nothing to close."""
+    if col != len(line):
+        return None
+    seq = parse_line(line)
+    frac = _find_innermost_open_frac(seq)
+    if frac is None:
+        return None
+    new_line = line[:frac.den_start] + "(" + line[frac.den_start:] + ")"
+    return new_line, len(new_line)

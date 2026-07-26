@@ -1,8 +1,5 @@
-Notes on the derivation:
- 
-$$
+Notes on the derivation — this part stays plain text.
+
+PLAINMATH
 a+b/c+d
-$$
- 
-The result above should hold for all positive integers.
- 
+a/b
