@@ -38,7 +38,14 @@ from prompt_toolkit.layout.layout import Layout
 from prompt_toolkit.layout.screen import Point
 from prompt_toolkit.styles import Style
 
-from engine import render_line, locate_cursor, next_stop, prev_stop
+from engine import (
+    render_line,
+    locate_cursor,
+    next_stop,
+    prev_stop,
+    widen_numerator_for_edit,
+    ATOM_CHARS_RE,
+)
 
 PLAINMATH_FLAG = "PLAINMATH"
 
@@ -259,7 +266,26 @@ def make_app(filepath: str) -> Application:
 
     @bindings.add(Keys.Any)
     def _insert(event):
-        buffer.insert_text(event.data)
+        text = event.data
+        row = cursor_line_of(buffer)
+        lines = buffer.text.split("\n")
+        math_start = find_math_start(lines)
+        in_math_line = math_start is not None and row >= math_start
+
+        if in_math_line and text and not ATOM_CHARS_RE.match(text):
+            line = lines[row]
+            col = buffer.document.cursor_position_col
+            result = widen_numerator_for_edit(line, col)
+            if result is not None:
+                new_line, new_col = result
+                if new_line != line:
+                    new_lines = lines[:row] + [new_line] + lines[row + 1:]
+                    buffer.text = "\n".join(new_lines)
+                buffer.cursor_position = buffer.document.translate_row_col_to_index(
+                    row, new_col
+                )
+
+        buffer.insert_text(text)
 
     style = Style.from_dict(
         {
@@ -281,8 +307,21 @@ def main() -> None:
         print("Usage: python plainmath.py <file>")
         sys.exit(1)
 
-    app = make_app(sys.argv[1])
-    app.run()
+    try:
+        app = make_app(sys.argv[1])
+        app.run()
+    except SystemExit:
+        raise
+    except BaseException:
+        # A full-screen app runs in the terminal's alternate screen
+        # buffer — if it crashes, the terminal can flip back to the
+        # normal prompt before you ever see the traceback, making a
+        # real crash look like "nothing happened." Print it and pause
+        # so it stays on screen instead of vanishing.
+        import traceback
+        traceback.print_exc()
+        input("\n[plainmath crashed — press Enter to close] ")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -91,6 +91,13 @@ def _parse_sequence(s: str, pos: int, end: int) -> Tuple[Sequence, int]:
             op = s[pos]
             pos += 1
         if pos >= end:
+            if op:
+                # A trailing operator with nothing after it (e.g. the user
+                # just typed "a+") still needs a term so it isn't silently
+                # dropped from the parse — otherwise it never renders and
+                # cursor math for this line falls out of sync with the
+                # raw text. Give it an empty placeholder term.
+                terms.append((op, TextNode(text="", start=pos, end=pos)))
             break
         if _is_prose_char(s[pos]):
             j = pos
@@ -300,8 +307,21 @@ def _locate_in_term(term: Term, raw_offset: int) -> Tuple[int, int]:
 def cursor_stops(line: str) -> List[int]:
     stops = {0, len(line)}
     for m in STOP_TOKEN_RE.finditer(line):
-        stops.add(m.start())
-        stops.add(m.end())
+        if m.group(0)[0] in OPERATOR_CHARS:
+            # Operators (+ - = *) are single-character elements: you can
+            # stand right before or right after one, but never "inside"
+            # it — there's nothing to step into.
+            stops.add(m.start())
+            stops.add(m.end())
+        else:
+            # A run of atom characters (a variable name like "Re", or
+            # several single-char variables sitting next to each other
+            # like "ab") is still made of ordinary characters underneath.
+            # Expose every position inside it, not just its two ends, so
+            # Left/Right can land in the middle ("R|e") just like it
+            # would in a plain text file.
+            for p in range(m.start(), m.end() + 1):
+                stops.add(p)
     return sorted(stops)
 
 
@@ -331,6 +351,78 @@ def _find_innermost_open_frac(seq: Sequence):
         inner = _find_innermost_open_frac(term.denominator)
         return inner if inner is not None else term
     return None
+
+
+def _find_frac_numerator_edit(seq: Sequence, col: int):
+    """Recursively search a parsed sequence for a FracNode whose bare
+    (un-grouped) Atom numerator spans raw column `col` — i.e. the
+    cursor sits anywhere at or inside that numerator, immediately
+    before the fraction's slash. This covers the cursor sitting at the
+    very start of the numerator ("|b/b"), in the middle of a
+    multi-character one ("R|e/im"), or right at its end ("b|/b") —
+    editing at any of those spots should widen the numerator, not just
+    the boundary right before the slash.
+
+    A numerator that's already an explicit Group only needs help when
+    the cursor sits exactly at its right edge, right before the slash;
+    edits *inside* an existing group are already safe on their own,
+    since the group protects its contents from the slash reinterpreting
+    them."""
+    for _op, term in seq:
+        if isinstance(term, FracNode):
+            num = term.numerator
+            if isinstance(num, GroupNode):
+                if term.slash_pos == col:
+                    return term
+                found = _find_frac_numerator_edit(num.inner, col)
+                if found is not None:
+                    return found
+            else:
+                if num.start <= col <= num.end:
+                    return term
+            found = _find_frac_numerator_edit(term.denominator, col)
+            if found is not None:
+                return found
+        elif isinstance(term, GroupNode):
+            found = _find_frac_numerator_edit(term.inner, col)
+            if found is not None:
+                return found
+    return None
+
+
+def widen_numerator_for_edit(line: str, col: int):
+    """If the cursor sits at, or anywhere inside, a fraction's bare
+    (un-grouped) numerator, typing something that isn't a plain atom
+    character there — "+", "-", a space, "(", etc. — would otherwise
+    get spliced into the raw text right where it stands, which the
+    parser then reinterprets around the slash rather than treating it
+    as part of the numerator you're sitting in (e.g. "b/b" + cursor
+    before the first "b" + typing "a+" naively becomes "a+b/b", which
+    parses as "a + (b/b)", not "(a+b)/b").
+
+    This wraps the whole numerator in an explicit group first (the same
+    mechanism the '/' key already uses for a highlighted numerator —
+    it renders with no visible parens, just a proper stacked fraction)
+    and returns the edit point shifted to land in the same logical spot
+    inside it. If the numerator is already an explicit group and the
+    cursor is right at its boundary before the slash, no rewrite is
+    needed — just step the cursor inside it.
+
+    Returns (new_line, new_col), or None if the cursor isn't at such a
+    spot and no special handling is needed.
+    """
+    seq = parse_line(line)
+    frac = _find_frac_numerator_edit(seq, col)
+    if frac is None:
+        return None
+
+    if isinstance(frac.numerator, GroupNode):
+        return line, frac.numerator.end - 1
+
+    start, end = frac.numerator.start, frac.numerator.end
+    new_line = line[:start] + "(" + line[start:end] + ")" + line[end:]
+    new_col = col + 1
+    return new_line, new_col
 
 
 def try_close_fraction(line: str, col: int):

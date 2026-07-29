@@ -1,0 +1,193 @@
+[1mdiff --git a/engine.py b/engine.py[m
+[1mindex 9da1aa5..b599b2d 100644[m
+[1m--- a/engine.py[m
+[1m+++ b/engine.py[m
+[36m@@ -91,6 +91,13 @@[m [mdef _parse_sequence(s: str, pos: int, end: int) -> Tuple[Sequence, int]:[m
+             op = s[pos][m
+             pos += 1[m
+         if pos >= end:[m
+[32m+[m[32m            if op:[m
+[32m+[m[32m                # A trailing operator with nothing after it (e.g. the user[m
+[32m+[m[32m                # just typed "a+") still needs a term so it isn't silently[m
+[32m+[m[32m                # dropped from the parse — otherwise it never renders and[m
+[32m+[m[32m                # cursor math for this line falls out of sync with the[m
+[32m+[m[32m                # raw text. Give it an empty placeholder term.[m
+[32m+[m[32m                terms.append((op, TextNode(text="", start=pos, end=pos)))[m
+             break[m
+         if _is_prose_char(s[pos]):[m
+             j = pos[m
+[36m@@ -300,8 +307,21 @@[m [mdef _locate_in_term(term: Term, raw_offset: int) -> Tuple[int, int]:[m
+ def cursor_stops(line: str) -> List[int]:[m
+     stops = {0, len(line)}[m
+     for m in STOP_TOKEN_RE.finditer(line):[m
+[31m-        stops.add(m.start())[m
+[31m-        stops.add(m.end())[m
+[32m+[m[32m        if m.group(0)[0] in OPERATOR_CHARS:[m
+[32m+[m[32m            # Operators (+ - = *) are single-character elements: you can[m
+[32m+[m[32m            # stand right before or right after one, but never "inside"[m
+[32m+[m[32m            # it — there's nothing to step into.[m
+[32m+[m[32m            stops.add(m.start())[m
+[32m+[m[32m            stops.add(m.end())[m
+[32m+[m[32m        else:[m
+[32m+[m[32m            # A run of atom characters (a variable name like "Re", or[m
+[32m+[m[32m            # several single-char variables sitting next to each other[m
+[32m+[m[32m            # like "ab") is still made of ordinary characters underneath.[m
+[32m+[m[32m            # Expose every position inside it, not just its two ends, so[m
+[32m+[m[32m            # Left/Right can land in the middle ("R|e") just like it[m
+[32m+[m[32m            # would in a plain text file.[m
+[32m+[m[32m            for p in range(m.start(), m.end() + 1):[m
+[32m+[m[32m                stops.add(p)[m
+     return sorted(stops)[m
+ [m
+ [m
+[36m@@ -333,6 +353,78 @@[m [mdef _find_innermost_open_frac(seq: Sequence):[m
+     return None[m
+ [m
+ [m
+[32m+[m[32mdef _find_frac_numerator_edit(seq: Sequence, col: int):[m
+[32m+[m[32m    """Recursively search a parsed sequence for a FracNode whose bare[m
+[32m+[m[32m    (un-grouped) Atom numerator spans raw column `col` — i.e. the[m
+[32m+[m[32m    cursor sits anywhere at or inside that numerator, immediately[m
+[32m+[m[32m    before the fraction's slash. This covers the cursor sitting at the[m
+[32m+[m[32m    very start of the numerator ("|b/b"), in the middle of a[m
+[32m+[m[32m    multi-character one ("R|e/im"), or right at its end ("b|/b") —[m
+[32m+[m[32m    editing at any of those spots should widen the numerator, not just[m
+[32m+[m[32m    the boundary right before the slash.[m
+[32m+[m
+[32m+[m[32m    A numerator that's already an explicit Group only needs help when[m
+[32m+[m[32m    the cursor sits exactly at its right edge, right before the slash;[m
+[32m+[m[32m    edits *inside* an existing group are already safe on their own,[m
+[32m+[m[32m    since the group protects its contents from the slash reinterpreting[m
+[32m+[m[32m    them."""[m
+[32m+[m[32m    for _op, term in seq:[m
+[32m+[m[32m        if isinstance(term, FracNode):[m
+[32m+[m[32m            num = term.numerator[m
+[32m+[m[32m            if isinstance(num, GroupNode):[m
+[32m+[m[32m                if term.slash_pos == col:[m
+[32m+[m[32m                    return term[m
+[32m+[m[32m                found = _find_frac_numerator_edit(num.inner, col)[m
+[32m+[m[32m                if found is not None:[m
+[32m+[m[32m                    return found[m
+[32m+[m[32m            else:[m
+[32m+[m[32m                if num.start <= col <= num.end:[m
+[32m+[m[32m                    return term[m
+[32m+[m[32m            found = _find_frac_numerator_edit(term.denominator, col)[m
+[32m+[m[32m            if found is not None:[m
+[32m+[m[32m                return found[m
+[32m+[m[32m        elif isinstance(term, GroupNode):[m
+[32m+[m[32m            found = _find_frac_numerator_edit(term.inner, col)[m
+[32m+[m[32m            if found is not None:[m
+[32m+[m[32m                return found[m
+[32m+[m[32m    return None[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef widen_numerator_for_edit(line: str, col: int):[m
+[32m+[m[32m    """If the cursor sits at, or anywhere inside, a fraction's bare[m
+[32m+[m[32m    (un-grouped) numerator, typing something that isn't a plain atom[m
+[32m+[m[32m    character there — "+", "-", a space, "(", etc. — would otherwise[m
+[32m+[m[32m    get spliced into the raw text right where it stands, which the[m
+[32m+[m[32m    parser then reinterprets around the slash rather than treating it[m
+[32m+[m[32m    as part of the numerator you're sitting in (e.g. "b/b" + cursor[m
+[32m+[m[32m    before the first "b" + typing "a+" naively becomes "a+b/b", which[m
+[32m+[m[32m    parses as "a + (b/b)", not "(a+b)/b").[m
+[32m+[m
+[32m+[m[32m    This wraps the whole numerator in an explicit group first (the same[m
+[32m+[m[32m    mechanism the '/' key already uses for a highlighted numerator —[m
+[32m+[m[32m    it renders with no visible parens, just a proper stacked fraction)[m
+[32m+[m[32m    and returns the edit point shifted to land in the same logical spot[m
+[32m+[m[32m    inside it. If the numerator is already an explicit group and the[m
+[32m+[m[32m    cursor is right at its boundary before the slash, no rewrite is[m
+[32m+[m[32m    needed — just step the cursor inside it.[m
+[32m+[m
+[32m+[m[32m    Returns (new_line, new_col), or None if the cursor isn't at such a[m
+[32m+[m[32m    spot and no special handling is needed.[m
+[32m+[m[32m    """[m
+[32m+[m[32m    seq = parse_line(line)[m
+[32m+[m[32m    frac = _find_frac_numerator_edit(seq, col)[m
+[32m+[m[32m    if frac is None:[m
+[32m+[m[32m        return None[m
+[32m+[m
+[32m+[m[32m    if isinstance(frac.numerator, GroupNode):[m
+[32m+[m[32m        return line, frac.numerator.end - 1[m
+[32m+[m
+[32m+[m[32m    start, end = frac.numerator.start, frac.numerator.end[m
+[32m+[m[32m    new_line = line[:start] + "(" + line[start:end] + ")" + line[end:][m
+[32m+[m[32m    new_col = col + 1[m
+[32m+[m[32m    return new_line, new_col[m
+[32m+[m
+[32m+[m
+ def try_close_fraction(line: str, col: int):[m
+     """If the cursor is at the true end of the line and there's an open[m
+     (un-parenthesized) fraction denominator there, wrap it in parens.[m
+[1mdiff --git a/plainmath.py b/plainmath.py[m
+[1mindex 5fb4b42..0b8e482 100644[m
+[1m--- a/plainmath.py[m
+[1m+++ b/plainmath.py[m
+[36m@@ -38,7 +38,14 @@[m [mfrom prompt_toolkit.layout.layout import Layout[m
+ from prompt_toolkit.layout.screen import Point[m
+ from prompt_toolkit.styles import Style[m
+ [m
+[31m-from engine import render_line, locate_cursor, next_stop, prev_stop[m
+[32m+[m[32mfrom engine import ([m
+[32m+[m[32m    render_line,[m
+[32m+[m[32m    locate_cursor,[m
+[32m+[m[32m    next_stop,[m
+[32m+[m[32m    prev_stop,[m
+[32m+[m[32m    widen_numerator_for_edit,[m
+[32m+[m[32m    ATOM_CHARS_RE,[m
+[32m+[m[32m)[m
+ [m
+ PLAINMATH_FLAG = "PLAINMATH"[m
+ [m
+[36m@@ -259,7 +266,26 @@[m [mdef make_app(filepath: str) -> Application:[m
+ [m
+     @bindings.add(Keys.Any)[m
+     def _insert(event):[m
+[31m-        buffer.insert_text(event.data)[m
+[32m+[m[32m        text = event.data[m
+[32m+[m[32m        row = cursor_line_of(buffer)[m
+[32m+[m[32m        lines = buffer.text.split("\n")[m
+[32m+[m[32m        math_start = find_math_start(lines)[m
+[32m+[m[32m        in_math_line = math_start is not None and row >= math_start[m
+[32m+[m
+[32m+[m[32m        if in_math_line and text and not ATOM_CHARS_RE.match(text):[m
+[32m+[m[32m            line = lines[row][m
+[32m+[m[32m            col = buffer.document.cursor_position_col[m
+[32m+[m[32m            result = widen_numerator_for_edit(line, col)[m
+[32m+[m[32m            if result is not None:[m
+[32m+[m[32m                new_line, new_col = result[m
+[32m+[m[32m                if new_line != line:[m
+[32m+[m[32m                    new_lines = lines[:row] + [new_line] + lines[row + 1:][m
+[32m+[m[32m                    buffer.text = "\n".join(new_lines)[m
+[32m+[m[32m                buffer.cursor_position = buffer.document.translate_row_col_to_index([m
+[32m+[m[32m                    row, new_col[m
+[32m+[m[32m                )[m
+[32m+[m
+[32m+[m[32m        buffer.insert_text(text)[m
+ [m
+     style = Style.from_dict([m
+         {[m
+[36m@@ -281,8 +307,21 @@[m [mdef main() -> None:[m
+         print("Usage: python plainmath.py <file>")[m
+         sys.exit(1)[m
+ [m
+[31m-    app = make_app(sys.argv[1])[m
+[31m-    app.run()[m
+[32m+[m[32m    try:[m
+[32m+[m[32m        app = make_app(sys.argv[1])[m
+[32m+[m[32m        app.run()[m
+[32m+[m[32m    except SystemExit:[m
+[32m+[m[32m        raise[m
+[32m+[m[32m    except BaseException:[m
+[32m+[m[32m        # A full-screen app runs in the terminal's alternate screen[m
+[32m+[m[32m        # buffer — if it crashes, the terminal can flip back to the[m
+[32m+[m[32m        # normal prompt before you ever see the traceback, making a[m
+[32m+[m[32m        # real crash look like "nothing happened." Print it and pause[m
+[32m+[m[32m        # so it stays on screen instead of vanishing.[m
+[32m+[m[32m        import traceback[m
+[32m+[m[32m        traceback.print_exc()[m
+[32m+[m[32m        input("\n[plainmath crashed — press Enter to close] ")[m
+[32m+[m[32m        sys.exit(1)[m
+ [m
+ [m
+ if __name__ == "__main__":[m
