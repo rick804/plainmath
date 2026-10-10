@@ -1,28 +1,23 @@
 #!/usr/bin/env python3
+
 """
-plainmath — a terminal-native structured math editor that renders
-editable 2D equations using plain text.
+plainmath — terminal-native structured math editor.
 
-Proof of concept:
-  - Opens a plain-text file.
-  - If a line reading exactly "PLAINMATH" appears anywhere in the file,
-    every line AFTER it is treated as math and rendered live — no
-    per-block delimiters needed. Everything above (and the flag line
-    itself) stays as plain, unrendered text.
-  - As you type, "a/b" is rendered immediately, in place, as a stacked
-    fraction — no separate preview pane.
-  - Numerator defaults to the single token right before "/". Highlight
-    a wider expression and press "/" to make the highlight the
-    numerator instead (it gets wrapped in parens under the hood).
-  - Denominator is everything after "/" to the end of the line.
-  - In math mode, Left/Right move element-by-element (whole tokens,
-    not characters). Above the flag (plain text), they move char by
-    char as usual. Up/Down always move one real line at a time.
-  - Ctrl+S saves. The file on disk always stores the plain "a/b" form
-    — only the display is rendered as 2D math.
+PRE-RENDER contains the actual editable source.
 
-Usage:
-    python plainmath.py <file>
+RENDERED contains the mathematical representation.
+
+Fractions:
+
+    a/b              -> {a/b}
+    a/b+c            -> {a/b+c}
+    a+b/c+d          -> {a+b/c+d}
+    a+b/c+d/e        -> a+{b/c+{d/e}}
+
+The source cursor is authoritative.
+
+Every source insertion position is reachable with the arrow keys,
+including positions immediately before and after structural braces.
 """
 
 import sys
@@ -32,8 +27,18 @@ from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.document import Document
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
-from prompt_toolkit.layout.containers import HSplit, Window
-from prompt_toolkit.layout.controls import FormattedTextControl, UIContent, UIControl
+
+from prompt_toolkit.layout.containers import (
+    HSplit,
+    Window,
+)
+
+from prompt_toolkit.layout.controls import (
+    FormattedTextControl,
+    UIContent,
+    UIControl,
+)
+
 from prompt_toolkit.layout.layout import Layout
 from prompt_toolkit.layout.screen import Point
 from prompt_toolkit.styles import Style
@@ -43,284 +48,1083 @@ from engine import (
     locate_cursor,
     next_stop,
     prev_stop,
-    widen_numerator_for_edit,
-    ATOM_CHARS_RE,
+    insert_fraction,
+    make_fraction_from_selection,
+    collapse_fraction,
 )
+
 
 PLAINMATH_FLAG = "PLAINMATH"
 
 
-def find_math_start(lines: list[str]) -> int | None:
-    """Return the index of the first line that is IN math mode (i.e. the
-    line right after the PLAINMATH flag), or None if the flag isn't
-    present anywhere in the file."""
+# ==========================================================================
+# Helpers
+# ==========================================================================
+
+def find_math_start(lines):
+
     for i, line in enumerate(lines):
+
         if line.strip().upper() == PLAINMATH_FLAG:
             return i + 1
+
     return None
 
 
-class MathEditorControl(UIControl):
-    """Renders the buffer's text with math-mode lines transformed in
-    place, while keystrokes still edit the plain-text buffer underneath."""
+def cursor_line_of(buffer):
 
-    def __init__(self, buffer: Buffer):
+    return buffer.document.cursor_position_row
+
+
+def cursor_col_of(buffer):
+
+    return buffer.document.cursor_position_col
+
+
+def set_cursor_row_col(
+    buffer,
+    row,
+    col,
+):
+
+    lines = buffer.text.split("\n")
+
+    if not lines:
+        return
+
+    row = max(
+        0,
+        min(
+            row,
+            len(lines) - 1,
+        ),
+    )
+
+    col = max(
+        0,
+        min(
+            col,
+            len(lines[row]),
+        ),
+    )
+
+    buffer.cursor_position = (
+        buffer.document
+        .translate_row_col_to_index(
+            row,
+            col,
+        )
+    )
+
+
+# ==========================================================================
+# PRE-RENDER CONTROL
+# ==========================================================================
+
+class SourceEditorControl(UIControl):
+
+    def __init__(self, buffer):
+
         self.buffer = buffer
 
-    def is_focusable(self) -> bool:
+    def is_focusable(self):
+
         return True
 
-    def create_content(self, width: int, height: int) -> UIContent:
+    def create_content(
+        self,
+        width,
+        height,
+    ):
+
         text = self.buffer.text
         lines = text.split("\n")
-        cursor_row, cursor_col = self.buffer.document.translate_index_to_position(
-            self.buffer.cursor_position
+
+        if not lines:
+            lines = [""]
+
+        cursor_row = (
+            self.buffer.document
+            .cursor_position_row
         )
-        math_start = find_math_start(lines)
 
-        output: list[list[tuple[str, str]]] = []
-        cursor_point = None
+        cursor_col = (
+            self.buffer.document
+            .cursor_position_col
+        )
 
-        for i, line in enumerate(lines):
-            in_math = math_start is not None and i >= math_start
+        # Always clamp the cursor against the actual source line.
+        cursor_row = max(
+            0,
+            min(
+                cursor_row,
+                len(lines) - 1,
+            ),
+        )
 
-            if in_math:
-                try:
-                    rendered = render_line(line)
-                    if not rendered:
-                        rendered = [""]
-                    cur_row, cur_col = (0, cursor_col)
-                    if i == cursor_row:
-                        cur_row, cur_col = locate_cursor(line, cursor_col)
-                except Exception:
-                    # Never let a math-rendering edge case silently freeze
-                    # the screen (and hide where the cursor really is) —
-                    # fall back to showing this line as plain text instead.
-                    rendered = [line]
-                    cur_row, cur_col = 0, cursor_col
-                for r_idx, r_line in enumerate(rendered):
-                    output.append([("class:math", r_line)])
-                    if i == cursor_row and r_idx == cur_row:
-                        cursor_point = Point(x=cur_col, y=len(output) - 1)
-            else:
-                output.append([("", line)])
-                if i == cursor_row:
-                    cursor_point = Point(x=cursor_col, y=len(output) - 1)
+        cursor_col = max(
+            0,
+            min(
+                cursor_col,
+                len(lines[cursor_row]),
+            ),
+        )
 
-        if cursor_point is None:
-            cursor_point = Point(x=0, y=0)
-        if not output:
-            output = [[("", "")]]
+        output = []
 
-        def get_line(i: int):
-            return output[i]
+        for line in lines:
+
+            output.append([
+                (
+                    "class:source",
+                    line,
+                )
+            ])
+
+        # Point.x is the exact character insertion position.
+        cursor_point = Point(
+            x=cursor_col,
+            y=cursor_row,
+        )
 
         return UIContent(
-            get_line=get_line,
+            get_line=lambda i: output[i],
             line_count=len(output),
             cursor_position=cursor_point,
             show_cursor=True,
         )
 
 
-def cursor_line_of(buffer: Buffer) -> int:
-    return buffer.document.cursor_position_row
+# ==========================================================================
+# RENDERED CONTROL
+# ==========================================================================
+
+class RenderedMathControl(UIControl):
+
+    def __init__(self, buffer):
+
+        self.buffer = buffer
+
+    def is_focusable(self):
+
+        return False
+
+    def create_content(
+        self,
+        width,
+        height,
+    ):
+
+        text = self.buffer.text
+        lines = text.split("\n")
+
+        if not lines:
+            lines = [""]
+
+        cursor_row = (
+            self.buffer.document
+            .cursor_position_row
+        )
+
+        cursor_col = (
+            self.buffer.document
+            .cursor_position_col
+        )
+
+        cursor_row = max(
+            0,
+            min(
+                cursor_row,
+                len(lines) - 1,
+            ),
+        )
+
+        cursor_col = max(
+            0,
+            min(
+                cursor_col,
+                len(lines[cursor_row]),
+            ),
+        )
+
+        output = []
+        cursor_point = None
+
+        math_start = find_math_start(
+            lines
+        )
+
+        for source_row, line in enumerate(lines):
+
+            in_math = (
+                math_start is not None
+                and source_row >= math_start
+            )
+
+            # --------------------------------------------------------------
+            # Plain text.
+            # --------------------------------------------------------------
+
+            if not in_math:
+
+                rendered_line = line
+
+                output.append([
+                    (
+                        "class:rendered",
+                        rendered_line,
+                    )
+                ])
+
+                if source_row == cursor_row:
+
+                    cursor_point = Point(
+                        x=min(
+                            cursor_col,
+                            len(rendered_line),
+                        ),
+                        y=len(output) - 1,
+                    )
+
+                continue
+
+            # --------------------------------------------------------------
+            # Mathematical line.
+            # --------------------------------------------------------------
+
+            try:
+
+                rendered_lines = render_line(
+                    line
+                )
+
+                if not rendered_lines:
+                    rendered_lines = [""]
+
+            except Exception:
+
+                rendered_lines = [line]
+
+            visual_row = None
+            visual_col = None
+
+            if source_row == cursor_row:
+
+                try:
+
+                    visual_row, visual_col = locate_cursor(
+                        line,
+                        cursor_col,
+                    )
+
+                except Exception:
+
+                    visual_row = 0
+
+                    visual_col = min(
+                        cursor_col,
+                        len(rendered_lines[0]),
+                    )
+
+            # Clamp rendered cursor coordinates too.
+            if visual_row is not None:
+
+                visual_row = max(
+                    0,
+                    min(
+                        visual_row,
+                        len(rendered_lines) - 1,
+                    ),
+                )
+
+                visual_col = max(
+                    0,
+                    min(
+                        visual_col,
+                        len(rendered_lines[visual_row]),
+                    ),
+                )
+
+            for rendered_row, rendered_line in enumerate(
+                rendered_lines
+            ):
+
+                output.append([
+                    (
+                        "class:rendered",
+                        rendered_line,
+                    )
+                ])
+
+                if (
+                    source_row == cursor_row
+                    and rendered_row == visual_row
+                ):
+
+                    cursor_point = Point(
+                        x=min(
+                            visual_col,
+                            len(rendered_line),
+                        ),
+                        y=len(output) - 1,
+                    )
+
+        if not output:
+
+            output = [
+                [
+                    (
+                        "class:rendered",
+                        "",
+                    )
+                ]
+            ]
+
+        if cursor_point is None:
+
+            cursor_point = Point(
+                x=0,
+                y=0,
+            )
+
+        return UIContent(
+            get_line=lambda i: output[i],
+            line_count=len(output),
+            cursor_position=cursor_point,
+            show_cursor=True,
+        )
 
 
-def make_app(filepath: str) -> Application:
-    with open(filepath, "r", encoding="utf-8") as f:
+# ==========================================================================
+# Application
+# ==========================================================================
+
+def make_app(filepath):
+
+    with open(
+        filepath,
+        "r",
+        encoding="utf-8",
+    ) as f:
+
         text = f.read()
 
-    buffer = Buffer(document=Document(text, 0), multiline=True)
+    buffer = Buffer(
+        document=Document(
+            text,
+            0,
+        ),
+        multiline=True,
+    )
 
-    editor_window = Window(content=MathEditorControl(buffer), wrap_lines=False)
+    source_window = Window(
+        content=SourceEditorControl(
+            buffer
+        ),
+        wrap_lines=False,
+        height=None,
+    )
+
+    rendered_window = Window(
+        content=RenderedMathControl(
+            buffer
+        ),
+        wrap_lines=False,
+        height=None,
+    )
+
+    source_header = Window(
+        content=FormattedTextControl(
+            lambda: " PRE-RENDER"
+        ),
+        height=1,
+        style="class:header",
+    )
+
+    rendered_header = Window(
+        content=FormattedTextControl(
+            lambda: " RENDERED"
+        ),
+        height=1,
+        style="class:header",
+    )
+
     status_window = Window(
         content=FormattedTextControl(
-            lambda: f" {filepath}  —  Ctrl+S save   Ctrl+C quit   "
-            f"Shift+Arrow to highlight, then '/' for a custom numerator"
+            lambda:
+                f" {filepath}   "
+                f"Ctrl+S save   "
+                f"Ctrl+Q save + quit   "
+                f"/ fraction   "
+                f"Shift+Arrow select"
         ),
         height=1,
         style="class:status",
     )
 
-    root_container = HSplit([editor_window, status_window])
+    root_container = HSplit([
+        source_header,
+        source_window,
+        rendered_header,
+        rendered_window,
+        status_window,
+    ])
 
     bindings = KeyBindings()
 
+    # ======================================================================
+    # Save
+    # ======================================================================
+
     @bindings.add("c-s")
     def _save(event):
-        with open(filepath, "w", encoding="utf-8") as f:
+
+        with open(
+            filepath,
+            "w",
+            encoding="utf-8",
+        ) as f:
+
             f.write(buffer.text)
 
-    @bindings.add("c-c")
+    # ======================================================================
+    # Save + quit
+    # ======================================================================
+
+    @bindings.add("c-q")
     def _quit(event):
+
+        with open(
+            filepath,
+            "w",
+            encoding="utf-8",
+        ) as f:
+
+            f.write(buffer.text)
+
         event.app.exit()
+
+    # ======================================================================
+    # Fraction
+    # ======================================================================
 
     @bindings.add("/")
     def _slash(event):
-        # If the user has highlighted text and then types '/', wrap the
-        # highlighted text in parens so it becomes the explicit numerator
-        # instead of just the last atomic token.
-        if buffer.selection_state is not None:
-            start, end = buffer.document.selection_range()
-            selected = buffer.text[start:end]
-            buffer.text = buffer.text[:start] + "(" + selected + ")/" + buffer.text[end:]
-            buffer.cursor_position = start + len(selected) + 3
-        else:
+
+        row = cursor_line_of(buffer)
+
+        lines = buffer.text.split("\n")
+
+        math_start = find_math_start(
+            lines
+        )
+
+        in_math = (
+            math_start is not None
+            and row >= math_start
+        )
+
+        if not in_math:
+
             buffer.insert_text("/")
-
-    @bindings.add("up")
-    def _up(event):
-        row = cursor_line_of(buffer)
-        lines = buffer.text.split("\n")
-        col = buffer.document.cursor_position_col
-        if row == 0:
             return
-        new_row = row - 1
-        target_col = min(col, len(lines[new_row]))
-        buffer.cursor_position = buffer.document.translate_row_col_to_index(
-            new_row, target_col
+
+        # --------------------------------------------------------------
+        # Selection.
+        # --------------------------------------------------------------
+
+        if buffer.selection_state is not None:
+
+            start, end = (
+                buffer.document
+                .selection_range()
+            )
+
+            line_start = (
+                buffer.document
+                .translate_row_col_to_index(
+                    row,
+                    0,
+                )
+            )
+
+            line_end = (
+                line_start
+                + len(lines[row])
+            )
+
+            selected = buffer.text[
+                start:end
+            ]
+
+            if (
+                "\n" not in selected
+                and start >= line_start
+                and end <= line_end
+            ):
+
+                local_start = (
+                    start - line_start
+                )
+
+                local_end = (
+                    end - line_start
+                )
+
+                line = lines[row]
+
+                new_line, new_col = (
+                    make_fraction_from_selection(
+                        line,
+                        local_start,
+                        local_end,
+                    )
+                )
+
+                lines[row] = new_line
+
+                buffer.text = "\n".join(
+                    lines
+                )
+
+                set_cursor_row_col(
+                    buffer,
+                    row,
+                    new_col,
+                )
+
+                return
+
+        # --------------------------------------------------------------
+        # Previous operand.
+        # --------------------------------------------------------------
+
+        line = lines[row]
+        col = cursor_col_of(buffer)
+
+        new_line, new_col = insert_fraction(
+            line,
+            col,
         )
 
-    @bindings.add("down")
-    def _down(event):
-        row = cursor_line_of(buffer)
-        lines = buffer.text.split("\n")
-        col = buffer.document.cursor_position_col
-        if row >= len(lines) - 1:
-            return
-        new_row = row + 1
-        target_col = min(col, len(lines[new_row]))
-        buffer.cursor_position = buffer.document.translate_row_col_to_index(
-            new_row, target_col
+        lines[row] = new_line
+
+        buffer.text = "\n".join(
+            lines
         )
 
-    @bindings.add("left")
-    def _left(event):
-        row = cursor_line_of(buffer)
-        lines = buffer.text.split("\n")
-        math_start = find_math_start(lines)
-        in_math_line = math_start is not None and row >= math_start
-        if in_math_line:
-            line = lines[row]
-            col = buffer.document.cursor_position_col
-            new_col = prev_stop(line, col)
-            if new_col == col and col == 0:
-                if row == 0:
-                    return
-                new_row = row - 1
-                buffer.cursor_position = buffer.document.translate_row_col_to_index(
-                    new_row, len(lines[new_row])
-                )
-                return
-            buffer.cursor_position = buffer.document.translate_row_col_to_index(row, new_col)
-        else:
-            buffer.cursor_left()
+        set_cursor_row_col(
+            buffer,
+            row,
+            new_col,
+        )
 
-    @bindings.add("right")
-    def _right(event):
-        row = cursor_line_of(buffer)
-        lines = buffer.text.split("\n")
-        math_start = find_math_start(lines)
-        in_math_line = math_start is not None and row >= math_start
-        if in_math_line:
-            line = lines[row]
-            col = buffer.document.cursor_position_col
-            new_col = next_stop(line, col)
-            if new_col == col and col == len(line):
-                if row >= len(lines) - 1:
-                    return
-                new_row = row + 1
-                buffer.cursor_position = buffer.document.translate_row_col_to_index(
-                    new_row, 0
-                )
-                return
-            buffer.cursor_position = buffer.document.translate_row_col_to_index(row, new_col)
-        else:
-            buffer.cursor_right()
-
-    @bindings.add("s-left")
-    def _shift_left(event):
-        if buffer.selection_state is None:
-            buffer.start_selection()
-        buffer.cursor_left()
-
-    @bindings.add("s-right")
-    def _shift_right(event):
-        if buffer.selection_state is None:
-            buffer.start_selection()
-        buffer.cursor_right()
-
-    @bindings.add("backspace")
-    def _backspace(event):
-        buffer.delete_before_cursor(1)
-
-    @bindings.add("delete")
-    def _delete(event):
-        buffer.delete(1)
+    # ======================================================================
+    # Enter
+    # ======================================================================
 
     @bindings.add("enter")
     @bindings.add("c-m")
     def _enter(event):
+
+        row = cursor_line_of(buffer)
+
+        lines = buffer.text.split("\n")
+
+        current_line = lines[row]
+
+        if current_line.strip() == "exit":
+
+            del lines[row]
+
+            if not lines:
+                lines = [""]
+
+            buffer.text = "\n".join(
+                lines
+            )
+
+            event.app.exit()
+            return
+
         buffer.insert_text("\n")
+
+    # ======================================================================
+    # Left
+    # ======================================================================
+
+    @bindings.add("left")
+    def _left(event):
+
+        row = cursor_line_of(buffer)
+
+        lines = buffer.text.split("\n")
+
+        math_start = find_math_start(
+            lines
+        )
+
+        in_math = (
+            math_start is not None
+            and row >= math_start
+        )
+
+        if not in_math:
+
+            buffer.cursor_left()
+            return
+
+        line = lines[row]
+        col = cursor_col_of(buffer)
+
+        new_col = prev_stop(
+            line,
+            col,
+        )
+
+        if (
+            new_col == col
+            and col == 0
+        ):
+
+            if row == 0:
+                return
+
+            new_row = row - 1
+
+            set_cursor_row_col(
+                buffer,
+                new_row,
+                len(lines[new_row]),
+            )
+
+            return
+
+        set_cursor_row_col(
+            buffer,
+            row,
+            new_col,
+        )
+
+    # ======================================================================
+    # Right
+    # ======================================================================
+
+    @bindings.add("right")
+    def _right(event):
+
+        row = cursor_line_of(buffer)
+
+        lines = buffer.text.split("\n")
+
+        math_start = find_math_start(
+            lines
+        )
+
+        in_math = (
+            math_start is not None
+            and row >= math_start
+        )
+
+        if not in_math:
+
+            buffer.cursor_right()
+            return
+
+        line = lines[row]
+        col = cursor_col_of(buffer)
+
+        new_col = next_stop(
+            line,
+            col,
+        )
+
+        if (
+            new_col == col
+            and col == len(line)
+        ):
+
+            if row >= len(lines) - 1:
+                return
+
+            new_row = row + 1
+
+            set_cursor_row_col(
+                buffer,
+                new_row,
+                0,
+            )
+
+            return
+
+        set_cursor_row_col(
+            buffer,
+            row,
+            new_col,
+        )
+
+    # ======================================================================
+    # Shift + Left
+    # ======================================================================
+
+    @bindings.add("s-left")
+    def _shift_left(event):
+
+        if buffer.selection_state is None:
+            buffer.start_selection()
+
+        row = cursor_line_of(buffer)
+
+        lines = buffer.text.split("\n")
+
+        math_start = find_math_start(
+            lines
+        )
+
+        in_math = (
+            math_start is not None
+            and row >= math_start
+        )
+
+        if not in_math:
+
+            buffer.cursor_left()
+            return
+
+        col = cursor_col_of(buffer)
+
+        new_col = prev_stop(
+            lines[row],
+            col,
+        )
+
+        set_cursor_row_col(
+            buffer,
+            row,
+            new_col,
+        )
+
+    # ======================================================================
+    # Shift + Right
+    # ======================================================================
+
+    @bindings.add("s-right")
+    def _shift_right(event):
+
+        if buffer.selection_state is None:
+            buffer.start_selection()
+
+        row = cursor_line_of(buffer)
+
+        lines = buffer.text.split("\n")
+
+        math_start = find_math_start(
+            lines
+        )
+
+        in_math = (
+            math_start is not None
+            and row >= math_start
+        )
+
+        if not in_math:
+
+            buffer.cursor_right()
+            return
+
+        col = cursor_col_of(buffer)
+
+        new_col = next_stop(
+            lines[row],
+            col,
+        )
+
+        set_cursor_row_col(
+            buffer,
+            row,
+            new_col,
+        )
+
+    # ======================================================================
+    # Up
+    # ======================================================================
+
+    @bindings.add("up")
+    def _up(event):
+
+        row = cursor_line_of(buffer)
+
+        lines = buffer.text.split("\n")
+
+        if row == 0:
+            return
+
+        col = cursor_col_of(buffer)
+
+        new_row = row - 1
+
+        target_col = min(
+            col,
+            len(lines[new_row]),
+        )
+
+        set_cursor_row_col(
+            buffer,
+            new_row,
+            target_col,
+        )
+
+    # ======================================================================
+    # Down
+    # ======================================================================
+
+    @bindings.add("down")
+    def _down(event):
+
+        row = cursor_line_of(buffer)
+
+        lines = buffer.text.split("\n")
+
+        if row >= len(lines) - 1:
+            return
+
+        col = cursor_col_of(buffer)
+
+        new_row = row + 1
+
+        target_col = min(
+            col,
+            len(lines[new_row]),
+        )
+
+        set_cursor_row_col(
+            buffer,
+            new_row,
+            target_col,
+        )
+
+    # ======================================================================
+    # Backspace
+    # ======================================================================
+
+    @bindings.add("backspace")
+    def _backspace(event):
+
+        row = cursor_line_of(buffer)
+
+        lines = buffer.text.split("\n")
+
+        math_start = find_math_start(
+            lines
+        )
+
+        in_math = (
+            math_start is not None
+            and row >= math_start
+        )
+
+        if not in_math:
+
+            buffer.delete_before_cursor(1)
+            return
+
+        line = lines[row]
+        col = cursor_col_of(buffer)
+
+        # --------------------------------------------------------------
+        # There are deliberately NO structural-brace guards here.
+        #
+        # Every source character is deletable.
+        #
+        # This fixes the old behavior where:
+        #
+        #     {|
+        #
+        # could not delete {
+        #
+        # and where some closing braces became effectively immutable.
+        # --------------------------------------------------------------
+
+        if col > 0:
+
+            buffer.delete_before_cursor(1)
+
+    # ======================================================================
+    # Delete
+    # ======================================================================
+
+    @bindings.add("delete")
+    def _delete(event):
+
+        row = cursor_line_of(buffer)
+
+        lines = buffer.text.split("\n")
+
+        math_start = find_math_start(
+            lines
+        )
+
+        in_math = (
+            math_start is not None
+            and row >= math_start
+        )
+
+        if not in_math:
+
+            buffer.delete(1)
+            return
+
+        # --------------------------------------------------------------
+        # Keep the slash-boundary collapse as the one special structural
+        # delete operation.
+        # --------------------------------------------------------------
+
+        line = lines[row]
+        col = cursor_col_of(buffer)
+
+        collapsed = collapse_fraction(
+            line,
+            col,
+        )
+
+        if collapsed is not None:
+
+            new_line, new_col = collapsed
+
+            lines[row] = new_line
+
+            buffer.text = "\n".join(
+                lines
+            )
+
+            set_cursor_row_col(
+                buffer,
+                row,
+                new_col,
+            )
+
+            return
+
+        # --------------------------------------------------------------
+        # Everything else, including { and }, is normally deletable.
+        # --------------------------------------------------------------
+
+        if col < len(line):
+
+            buffer.delete(1)
+
+    # ======================================================================
+    # Normal insertion
+    # ======================================================================
 
     @bindings.add(Keys.Any)
     def _insert(event):
-        text = event.data
-        row = cursor_line_of(buffer)
-        lines = buffer.text.split("\n")
-        math_start = find_math_start(lines)
-        in_math_line = math_start is not None and row >= math_start
 
-        if in_math_line and text and not ATOM_CHARS_RE.match(text):
-            line = lines[row]
-            col = buffer.document.cursor_position_col
-            result = widen_numerator_for_edit(line, col)
-            if result is not None:
-                new_line, new_col = result
-                if new_line != line:
-                    new_lines = lines[:row] + [new_line] + lines[row + 1:]
-                    buffer.text = "\n".join(new_lines)
-                buffer.cursor_position = buffer.document.translate_row_col_to_index(
-                    row, new_col
-                )
+        text = event.data
+
+        if not text:
+            return
+
+        row = cursor_line_of(buffer)
+
+        lines = buffer.text.split("\n")
+
+        math_start = find_math_start(
+            lines
+        )
+
+        in_math = (
+            math_start is not None
+            and row >= math_start
+        )
+
+        if not in_math:
+
+            buffer.insert_text(text)
+            return
+
+        # --------------------------------------------------------------
+        # IMPORTANT:
+        #
+        # Operators do not automatically escape fractions.
+        #
+        # Example:
+        #
+        #     {b/c|}
+        #
+        # typing +
+        #
+        #     {b/c+}
+        #
+        # Moving right once gives:
+        #
+        #     {b/c}|
+        #
+        # and typing + then produces:
+        #
+        #     {b/c}+
+        # --------------------------------------------------------------
 
         buffer.insert_text(text)
 
-    style = Style.from_dict(
-        {
-            "math": "#00ff5f",
-            "status": "bg:#444444 #ffffff",
-        }
-    )
+    # ======================================================================
+    # Style
+    # ======================================================================
+
+    style = Style.from_dict({
+        "header": "bold",
+        "source": "",
+        "rendered": "",
+        "status": "bg:#444444 #ffffff",
+    })
 
     return Application(
-        layout=Layout(root_container, focused_element=editor_window),
+        layout=Layout(
+            root_container,
+            focused_element=source_window,
+        ),
         key_bindings=bindings,
         style=style,
         full_screen=True,
     )
 
 
-def main() -> None:
+# ==========================================================================
+# Main
+# ==========================================================================
+
+def main():
+
     if len(sys.argv) != 2:
-        print("Usage: python plainmath.py <file>")
+
+        print(
+            "Usage: python plainmath.py <file>"
+        )
+
         sys.exit(1)
 
     try:
-        app = make_app(sys.argv[1])
+
+        app = make_app(
+            sys.argv[1]
+        )
+
         app.run()
+
     except SystemExit:
+
         raise
+
     except BaseException:
-        # A full-screen app runs in the terminal's alternate screen
-        # buffer — if it crashes, the terminal can flip back to the
-        # normal prompt before you ever see the traceback, making a
-        # real crash look like "nothing happened." Print it and pause
-        # so it stays on screen instead of vanishing.
+
         import traceback
+
         traceback.print_exc()
-        input("\n[plainmath crashed — press Enter to close] ")
+
+        input(
+            "\n[plainmath crashed — press Enter to close] "
+        )
+
         sys.exit(1)
 
 
